@@ -67,6 +67,7 @@ public class CommonSettings : CommandSettings
     }
 }
 
+// --- Replace WakeSettings with this version (adds --interface, removes DryRun) ---
 public sealed class WakeSettings : CommonSettings
 {
     [CommandOption("-b|--broadcast <IP>")]
@@ -93,6 +94,10 @@ public sealed class WakeSettings : CommonSettings
     [Description("If only IP is present, try to resolve MAC via ARP first. Default: true")]
     public bool TryArp { get; set; } = true;
 
+    [CommandOption("--interface <IP>")]
+    [Description("Source/local IPv4 address to bind when sending broadcast (useful on multi-homed hosts).")]
+    public string? InterfaceIp { get; set; }
+
     public override ValidationResult Validate()
     {
         var vr = base.Validate();
@@ -105,6 +110,14 @@ public sealed class WakeSettings : CommonSettings
         if (Repeat < 1) return ValidationResult.Error("--repeat must be >= 1.");
         if (IntervalMs < 0) return ValidationResult.Error("--interval-ms must be >= 0.");
         if (Parallelism < 1) return ValidationResult.Error("--parallelism must be >= 1.");
+
+        if (!string.IsNullOrWhiteSpace(InterfaceIp))
+        {
+            if (!IPAddress.TryParse(InterfaceIp, out var ip) || ip.AddressFamily != AddressFamily.InterNetwork)
+                return ValidationResult.Error("--interface must be a valid IPv4 address.");
+            if (ip.Equals(IPAddress.Any) || IPAddress.IsLoopback(ip))
+                return ValidationResult.Error("--interface must be a non-loopback, bound local IPv4.");
+        }
 
         return ValidationResult.Success();
     }
@@ -193,6 +206,10 @@ public sealed class WakeCommand : AsyncCommand<WakeSettings>
     {
         var broadcast = IPAddress.Parse(settings.Broadcast);
         var configFile = new FileInfo(settings.ConfigPath);
+        IPAddress? sourceIp = null;
+
+        if (!string.IsNullOrWhiteSpace(settings.InterfaceIp))
+            sourceIp = IPAddress.Parse(settings.InterfaceIp!);
 
         var (targets, problems) = ConfigLoader.Load(configFile);
         SpectreUi.PrintProblems(problems.Select(p => p.ToString()));
@@ -228,7 +245,7 @@ public sealed class WakeCommand : AsyncCommand<WakeSettings>
 
             try
             {
-                await WolSender.SendAsync(t.Mac, broadcast, settings.Port, settings.Repeat, settings.IntervalMs);
+                await WolSender.SendAsync(t.Mac, broadcast, settings.Port, settings.Repeat, settings.IntervalMs, sourceIp);
                 results.Add(SpectreUi.Row.Ok("Sent", t, sw.ElapsedMilliseconds));
                 Interlocked.Increment(ref ok);
             }
@@ -770,17 +787,26 @@ internal static class ConfigValidator
 
 internal static class WolSender
 {
-    public static async Task SendAsync(PhysicalAddress mac, IPAddress broadcast, int port, int repeat, int intervalMs)
+    public static Task SendAsync(PhysicalAddress mac, IPAddress broadcast, int port, int repeat, int intervalMs)
+        => SendAsync(mac, broadcast, port, repeat, intervalMs, sourceIp: null);
+
+    public static async Task SendAsync(PhysicalAddress mac, IPAddress broadcast, int port, int repeat, int intervalMs, IPAddress? sourceIp)
     {
         var packet = BuildMagicPacket(mac);
-        using var udp = new UdpClient { EnableBroadcast = true };
-        var endpoint = new IPEndPoint(broadcast, port);
 
-        for (int i = 0; i < repeat; i++)
+        UdpClient udp = sourceIp is null
+            ? new UdpClient() { EnableBroadcast = true }
+            : new UdpClient(new IPEndPoint(sourceIp, 0)) { EnableBroadcast = true };
+
+        using (udp)
         {
-            await udp.SendAsync(packet, packet.Length, endpoint);
-            if (i + 1 < repeat && intervalMs > 0)
-                await Task.Delay(intervalMs);
+            var endpoint = new IPEndPoint(broadcast, port);
+            for (int i = 0; i < repeat; i++)
+            {
+                await udp.SendAsync(packet, packet.Length, endpoint);
+                if (i + 1 < repeat && intervalMs > 0)
+                    await Task.Delay(intervalMs);
+            }
         }
     }
 
@@ -849,7 +875,7 @@ internal static class ArpHelper
         if (OperatingSystem.IsWindows())
         {
             var (ok, output) = await Run("arp", "-a");
-            if (!ok) return new();
+            if (!ok) return [];
             return ParseArpWindows(output);
         }
         else if (OperatingSystem.IsLinux())
@@ -860,12 +886,12 @@ internal static class ArpHelper
             (ok, output) = await Run("arp", "-an");
             if (ok) return ParseArpPosix(output);
 
-            return new();
+            return [];
         }
         else // macOS and others
         {
             var (ok, output) = await Run("arp", "-an");
-            if (!ok) return new();
+            if (!ok) return [];
             return ParseArpPosix(output);
         }
     }
