@@ -1,16 +1,13 @@
-﻿using Spectre.Console;
-using Spectre.Console.Cli;
-using System.Collections.Concurrent;
+﻿using System.Collections.Concurrent;
 using System.ComponentModel;
-using System.Data;
 using System.Diagnostics;
 using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Text;
 using System.Text.RegularExpressions;
-using Rule = Spectre.Console.Rule;
-using ValidationResult = Spectre.Console.ValidationResult;
+using Spectre.Console;
+using Spectre.Console.Cli;
 
 namespace WakeCli;
 
@@ -22,10 +19,19 @@ public sealed class Program
         app.Configure(config =>
         {
             config.SetApplicationName("wakecli");
+
             config.AddCommand<WakeCommand>("wake")
                   .WithDescription("Send Wake-on-LAN (magic packets) to targets from a config file.");
+
             config.AddCommand<QueryCommand>("query")
                   .WithDescription("Ping targets and show which are online.");
+
+            // New: preflight / lint (same command, two entry points)
+            config.AddCommand<PreflightCommand>("preflight")
+                  .WithDescription("Validate targets file and environment. Fails fast with errors before showtime.");
+
+            config.AddCommand<PreflightCommand>("lint")
+                  .WithDescription("Alias of 'preflight'. Validate targets file and environment.");
         });
 
         try
@@ -51,7 +57,7 @@ public class CommonSettings : CommandSettings
 {
     [CommandOption("-c|--config <PATH>")]
     [Description("Path to targets file (default: ./targets.txt)")]
-    public string ConfigPath { get; set; } = @"C:\TEMP\targets.txt";
+    public string ConfigPath { get; set; } = "targets.txt";
 
     public override ValidationResult Validate()
     {
@@ -135,6 +141,50 @@ public sealed class QuerySettings : CommonSettings
     }
 }
 
+// New: Preflight settings
+public sealed class PreflightSettings : CommonSettings
+{
+    [CommandOption("--fail-on-warn")]
+    [Description("Return non-zero exit code if warnings are present (in addition to errors).")]
+    public bool FailOnWarning { get; set; } = false;
+
+    [CommandOption("--show-ok")]
+    [Description("Also list OK/clean entries (by default only findings are printed).")]
+    public bool ShowOk { get; set; } = false;
+
+    [CommandOption("--env-checks")]
+    [Description("Run environment checks (arp/ip tools, OS support) and report issues. Default: true")]
+    public bool EnvChecks { get; set; } = true;
+
+    // NEW: Broadcast heuristics options
+    [CommandOption("--assume-prefix <CIDR>")]
+    [Description("CIDR prefix length used to group IPs into subnets for broadcast checks. Default: 24")]
+    public int AssumePrefix { get; set; } = 24;
+
+    [CommandOption("--planned-broadcast <IP>")]
+    [Description("Broadcast address you plan to use at runtime (e.g., 192.168.10.255 or 255.255.255.255).")]
+    public string? PlannedBroadcast { get; set; }
+
+    [CommandOption("--strict-broadcast")]
+    [Description("Treat broadcast coverage problems as errors instead of warnings.")]
+    public bool StrictBroadcast { get; set; } = false;
+
+    public override ValidationResult Validate()
+    {
+        var vr = base.Validate();
+        if (!vr.Successful) return vr;
+
+        if (AssumePrefix is < 8 or > 30)
+            return ValidationResult.Error("--assume-prefix must be between 8 and 30.");
+
+        if (!string.IsNullOrWhiteSpace(PlannedBroadcast) && !IPAddress.TryParse(PlannedBroadcast, out _))
+            return ValidationResult.Error("Invalid --planned-broadcast IP address.");
+
+        return ValidationResult.Success();
+    }
+}
+
+
 /* ============================= COMMANDS ============================= */
 
 public sealed class WakeCommand : AsyncCommand<WakeSettings>
@@ -145,7 +195,7 @@ public sealed class WakeCommand : AsyncCommand<WakeSettings>
         var configFile = new FileInfo(settings.ConfigPath);
 
         var (targets, problems) = ConfigLoader.Load(configFile);
-        SpectreUi.PrintProblems(problems);
+        SpectreUi.PrintProblems(problems.Select(p => p.ToString()));
 
         if (settings.TryArp)
         {
@@ -207,7 +257,7 @@ public sealed class QueryCommand : AsyncCommand<QuerySettings>
         var configFile = new FileInfo(settings.ConfigPath);
 
         var (targets, problems) = ConfigLoader.Load(configFile);
-        SpectreUi.PrintProblems(problems);
+        SpectreUi.PrintProblems(problems.Select(p => p.ToString()));
 
         if (settings.TryArp)
         {
@@ -270,17 +320,190 @@ public sealed class QueryCommand : AsyncCommand<QuerySettings>
     }
 }
 
+// New: Preflight / Lint command
+public sealed class PreflightCommand : AsyncCommand<PreflightSettings>
+{
+    public override async Task<int> ExecuteAsync(CommandContext context, PreflightSettings settings)
+    {
+        var configFile = new FileInfo(settings.ConfigPath);
+
+        var (targets, parseProblems) = ConfigLoader.Load(configFile);
+
+        var findings = new List<PreflightIssue>();
+
+        foreach (var p in parseProblems)
+        {
+            findings.Add(new PreflightIssue(
+                Severity.Error, p.LineNo, null, null, null,
+                p.Message, Suggestion: "Fix or remove this line."));
+        }
+
+        findings.AddRange(ConfigValidator.Validate(targets));
+
+        if (settings.EnvChecks)
+        {
+            findings.AddRange(await EnvironmentChecks.RunAsync());
+        }
+
+        // NEW: Broadcast heuristics
+        IPAddress? planned = null;
+        if (!string.IsNullOrWhiteSpace(settings.PlannedBroadcast))
+            planned = IPAddress.Parse(settings.PlannedBroadcast!);
+
+        findings.AddRange(BroadcastHeuristics.Analyze(
+            targets,
+            settings.AssumePrefix,
+            planned,
+            settings.StrictBroadcast));
+
+        var errorCount = findings.Count(f => f.Severity == Severity.Error);
+        var warnCount = findings.Count(f => f.Severity == Severity.Warning);
+        var okRows = ConfigValidator.IdentifyOkRows(targets).ToList();
+
+        SpectreUi.RenderPreflight(findings, okRows, settings.ShowOk, targets.Count);
+
+        if (errorCount > 0) return 1;
+        if (settings.FailOnWarning && warnCount > 0) return 1;
+        return 0;
+    }
+}
+
+internal static class BroadcastHeuristics
+{
+    public static IEnumerable<PreflightIssue> Analyze(
+        IEnumerable<Target> targets,
+        int prefixLen,
+        IPAddress? plannedBroadcast,
+        bool strict)
+    {
+        var list = new List<PreflightIssue>();
+
+        var ipv4s = targets
+            .Where(t => t.Ip is not null && t.Ip.AddressFamily == AddressFamily.InterNetwork)
+            .Select(t => t.Ip!)
+            .ToList();
+
+        if (ipv4s.Count == 0)
+        {
+            list.Add(new PreflightIssue(
+                Severity.Info, null, null, null, null,
+                "No IPv4 addresses found in configuration for broadcast analysis.",
+                "Add device IPs to enable broadcast coverage checks."));
+            return list;
+        }
+
+        uint mask = prefixLen == 0 ? 0u : 0xFFFFFFFFu << (32 - prefixLen);
+        var groups = ipv4s.GroupBy(ip => IpToUInt(ip) & mask)
+                          .Select(g => new
+                          {
+                              Network = g.Key,
+                              Count = g.Count()
+                          })
+                          .ToList();
+
+        var recommendedBcasts = groups
+            .Select(g => UIntToIp(g.Network | ~mask))
+            .ToList();
+
+        // Info row: show detected subnets and sizes
+        var summary = string.Join(", ",
+            groups.Select(g => $"{UIntToIp(g.Network)}/{prefixLen} ({g.Count} host{(g.Count == 1 ? "" : "s")})"));
+        list.Add(new PreflightIssue(
+            Severity.Info, null, null, null, null,
+            $"Detected subnets (/{prefixLen}): {summary}",
+            $"Recommended directed broadcasts: {string.Join(", ", recommendedBcasts.Select(ip => ip.ToString()))}"));
+
+        if (groups.Count > 1)
+        {
+            list.Add(new PreflightIssue(
+                Severity.Warning, null, null, null, null,
+                $"Targets span multiple /{prefixLen} subnets ({groups.Count}).",
+                $"Use per-VLAN directed broadcasts: {string.Join(", ", recommendedBcasts.Select(ip => ip.ToString()))} or run 'wake' once per subnet."));
+
+            // Planned broadcast evaluation across multiple subnets
+            if (plannedBroadcast is not null)
+            {
+                bool isGlobal = plannedBroadcast.Equals(IPAddress.Broadcast);
+                bool matchesAny = recommendedBcasts.Any(bc => bc.Equals(plannedBroadcast));
+
+                if (isGlobal)
+                {
+                    list.Add(new PreflightIssue(
+                        strict ? Severity.Error : Severity.Warning, null, null, null, null,
+                        "Planned broadcast is 255.255.255.255 while targets span multiple subnets.",
+                        "Routers typically block limited broadcast across VLANs; use per-VLAN directed broadcasts."));
+                }
+                else if (!matchesAny)
+                {
+                    list.Add(new PreflightIssue(
+                        strict ? Severity.Error : Severity.Warning, null, null, null, null,
+                        $"Planned broadcast {plannedBroadcast} does not cover any detected /{prefixLen} subnet.",
+                        $"Use one of: {string.Join(", ", recommendedBcasts.Select(ip => ip.ToString()))}"));
+                }
+                else
+                {
+                    list.Add(new PreflightIssue(
+                        Severity.Warning, null, null, null, null,
+                        $"Planned broadcast {plannedBroadcast} covers only one of {groups.Count} subnets.",
+                        $"Also send to: {string.Join(", ", recommendedBcasts.Where(bc => !bc.Equals(plannedBroadcast)).Select(ip => ip.ToString()))}"));
+                }
+            }
+        }
+        else
+        {
+            // Single subnet guidance
+            var onlyRec = recommendedBcasts[0];
+            list.Add(new PreflightIssue(
+                Severity.Info, null, null, null, null,
+                $"All targets appear to be within one /{prefixLen} subnet.",
+                $"Recommended directed broadcast: {onlyRec}"));
+
+            if (plannedBroadcast is not null &&
+                !plannedBroadcast.Equals(IPAddress.Broadcast) &&
+                !plannedBroadcast.Equals(onlyRec))
+            {
+                list.Add(new PreflightIssue(
+                    Severity.Warning, null, null, null, null,
+                    $"Planned broadcast {plannedBroadcast} does not match the detected subnet’s broadcast {onlyRec}.",
+                    $"Consider using {onlyRec} to avoid upstream filtering."));
+            }
+        }
+
+        return list;
+    }
+
+    // ---------- helpers ----------
+    private static uint IpToUInt(IPAddress ip)
+    {
+        var b = ip.GetAddressBytes();
+        if (b.Length != 4) throw new ArgumentException("IPv4 address required.", nameof(ip));
+        return ((uint)b[0] << 24) | ((uint)b[1] << 16) | ((uint)b[2] << 8) | b[3];
+    }
+
+    private static IPAddress UIntToIp(uint v) =>
+        new([
+            (byte)((v >> 24) & 0xFF),
+            (byte)((v >> 16) & 0xFF),
+            (byte)((v >> 8) & 0xFF),
+            (byte)(v & 0xFF)
+        ]);
+}
+
+
+
 /* ============================= DOMAIN ============================= */
 
 internal sealed class Target
 {
+    public int LineNo { get; }
     public string? Label { get; set; }
     public IPAddress? Ip { get; set; }
     public PhysicalAddress? Mac { get; set; }
     public string Raw { get; }
 
-    public Target(string? label, IPAddress? ip, PhysicalAddress? mac, string raw)
+    public Target(int lineNo, string? label, IPAddress? ip, PhysicalAddress? mac, string raw)
     {
+        LineNo = lineNo;
         Label = label;
         Ip = ip;
         Mac = mac;
@@ -288,18 +511,27 @@ internal sealed class Target
     }
 }
 
+internal sealed record ConfigProblem(int LineNo, string Raw, string Message)
+{
+    public override string ToString()
+    {
+        var prefix = LineNo > 0 ? $"Line {LineNo}: " : "";
+        return $"{prefix}{Message}{(string.IsNullOrWhiteSpace(Raw) ? "" : $" — '{Raw}'")}";
+    }
+}
+
 internal static class ConfigLoader
 {
     private static readonly Regex MacRegex = new(@"(?i)\b([0-9A-F]{2}([-:])){5}[0-9A-F]{2}\b", RegexOptions.Compiled);
 
-    public static (List<Target> targets, List<string> problems) Load(FileInfo path)
+    public static (List<Target> targets, List<ConfigProblem> problems) Load(FileInfo path)
     {
         var targets = new List<Target>();
-        var problems = new List<string>();
+        var problems = new List<ConfigProblem>();
 
         if (!path.Exists)
         {
-            problems.Add($"Config file not found: {path.FullName}");
+            problems.Add(new ConfigProblem(0, "", $"Config file not found: {path.FullName}"));
             return (targets, problems);
         }
 
@@ -316,7 +548,7 @@ internal static class ConfigLoader
             IPAddress? ip = null;
             PhysicalAddress? mac = null;
 
-            foreach (var token in parts.Select(p => p.Trim()))
+            foreach (var token in parts.Select(static p => p.Trim()))
             {
                 if (IPAddress.TryParse(token, out var ipParsed))
                 {
@@ -346,16 +578,193 @@ internal static class ConfigLoader
 
             if (ip == null && mac == null && label != null)
             {
-                problems.Add($"Line {lineNo}: '{line}' — no IP or MAC found; ignored.");
+                problems.Add(new ConfigProblem(lineNo, line, "No IP or MAC found; entry ignored."));
                 continue;
             }
 
-            targets.Add(new Target(label, ip, mac, line));
+            targets.Add(new Target(lineNo, label, ip, mac, line));
         }
 
         return (targets, problems);
     }
 }
+
+/* ======================= VALIDATION (PREFLIGHT) ===================== */
+
+internal enum Severity { Info, Warning, Error }
+
+internal sealed record PreflightIssue(
+    Severity Severity,
+    int? LineNo,
+    string? Label,
+    IPAddress? Ip,
+    PhysicalAddress? Mac,
+    string Message,
+    string? Suggestion = null);
+
+internal static class ConfigValidator
+{
+    public static IEnumerable<PreflightIssue> Validate(IEnumerable<Target> targets)
+    {
+        var list = new List<PreflightIssue>();
+        var tList = targets.ToList();
+
+        // 1) Per-target checks
+        foreach (var t in tList)
+        {
+            if (t.Ip is null && t.Mac is null)
+            {
+                list.Add(Issue(Severity.Error, t, "Entry has neither IP nor MAC.", "Add an IP and/or MAC or remove the line."));
+                continue;
+            }
+
+            if (t.Mac is null)
+                list.Add(Issue(Severity.Warning, t, "No MAC provided (Wake will be skipped).", "Add MAC to enable WOL for this device."));
+            if (t.Ip is null)
+                list.Add(Issue(Severity.Warning, t, "No IP provided (Query may be limited).", "Add IP to enable ping/query."));
+            if (string.IsNullOrWhiteSpace(t.Label))
+                list.Add(Issue(Severity.Warning, t, "No label provided.", "Add a human-friendly label for readability."));
+
+            // IP sanity
+            if (t.Ip is not null)
+            {
+                if (t.Ip.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork)
+                {
+                    list.Add(Issue(Severity.Warning, t, "IPv6 address detected.", "Supply an IPv4 address for WOL/query reliability."));
+                }
+                else
+                {
+                    if (IsUnspecified(t.Ip))
+                        list.Add(Issue(Severity.Error, t, "IP is 0.0.0.0 (unspecified).", "Replace with a valid host IPv4."));
+                    if (IPAddress.IsLoopback(t.Ip))
+                        list.Add(Issue(Severity.Warning, t, "Loopback address (127.0.0.0/8).", "Use a real host IPv4."));
+                    if (IsLinkLocal169(t.Ip))
+                        list.Add(Issue(Severity.Warning, t, "Link-local address (169.254.0.0/16).", "Use a DHCP/static IPv4 on your VLAN."));
+                    if (IsMulticast(t.Ip))
+                        list.Add(Issue(Severity.Warning, t, "Multicast address (224.0.0.0/4).", "Use a unicast host IPv4."));
+                    if (t.Ip.Equals(IPAddress.Broadcast))
+                        list.Add(Issue(Severity.Warning, t, "Broadcast address (255.255.255.255) used as a host IP.", "Replace with the device's IPv4."));
+                }
+            }
+
+            // MAC sanity
+            if (t.Mac is not null)
+            {
+                if (IsAllZeros(t.Mac))
+                    list.Add(Issue(Severity.Error, t, "MAC address is all zeros.", "Use the device's real MAC."));
+                else if (IsAllFFs(t.Mac))
+                    list.Add(Issue(Severity.Error, t, "MAC address is ff:ff:ff:ff:ff:ff.", "Use the device's real MAC."));
+                else if (IsMulticastMac(t.Mac))
+                    list.Add(Issue(Severity.Warning, t, "MAC multicast/group bit set.", "Verify the MAC; it should be a unicast address."));
+            }
+        }
+
+        // 2) Duplicate detection (MAC)
+        var macGroups = tList.Where(t => t.Mac != null)
+                             .GroupBy(t => NormalizeMac(t.Mac!))
+                             .Where(g => g.Count() > 1);
+        foreach (var g in macGroups)
+        {
+            var members = g.ToList();
+            foreach (var t in members)
+                list.Add(Issue(Severity.Error, t, $"Duplicate MAC appears {members.Count}×: {SpectreUi.FormatMac(t.Mac)}",
+                    "Ensure each device has a unique MAC; remove duplicates."));
+        }
+
+        // 3) Duplicate detection (IP)
+        var ipGroups = tList.Where(t => t.Ip != null)
+                            .GroupBy(t => t.Ip!.ToString())
+                            .Where(g => g.Count() > 1);
+        foreach (var g in ipGroups)
+        {
+            var members = g.ToList();
+            foreach (var t in members)
+                list.Add(Issue(Severity.Warning, t, $"Duplicate IP appears {members.Count}×: {t.Ip}",
+                    "Verify IP uniqueness or remove duplicates to avoid confusing results."));
+        }
+
+        // 4) Duplicate labels (case-insensitive)
+        var labelGroups = tList.Where(t => !string.IsNullOrWhiteSpace(t.Label))
+                               .GroupBy(t => t.Label!.Trim(), StringComparer.OrdinalIgnoreCase)
+                               .Where(g => g.Count() > 1);
+        foreach (var g in labelGroups)
+        {
+            var members = g.ToList();
+            foreach (var t in members)
+                list.Add(Issue(Severity.Warning, t, $"Duplicate label appears {members.Count}×: \"{t.Label}\"",
+                    "Make labels unique to avoid operator confusion."));
+        }
+
+        // 5) Exact duplicate rows (same Label/IP/MAC)
+        var rowGroups = tList.GroupBy(t => $"{t.Label}|{t.Ip}|{NormalizeMacOrNull(t.Mac)}")
+                             .Where(g => g.Count() > 1);
+        foreach (var g in rowGroups)
+        {
+            foreach (var t in g)
+                list.Add(Issue(Severity.Warning, t, "Duplicate entry (same Label/IP/MAC).", "Remove the repeated line."));
+        }
+
+        return list;
+    }
+
+    public static IEnumerable<SpectreUi.OkRow> IdentifyOkRows(IEnumerable<Target> targets)
+    {
+        // Rows with both IP and MAC, and no duplicates -> OK
+        var tList = targets.ToList();
+
+        var dupMac = new HashSet<string>(tList.Where(t => t.Mac != null)
+                                              .GroupBy(t => NormalizeMac(t.Mac!))
+                                              .Where(g => g.Count() > 1)
+                                              .Select(g => g.Key));
+        var dupIp = new HashSet<string>(tList.Where(t => t.Ip != null)
+                                             .GroupBy(t => t.Ip!.ToString())
+                                             .Where(g => g.Count() > 1)
+                                             .Select(g => g.Key));
+
+        foreach (var t in tList)
+        {
+            var macKey = t.Mac is null ? null : NormalizeMac(t.Mac);
+            var ipKey = t.Ip?.ToString();
+
+            var ok = t.Mac != null && t.Ip != null &&
+                     (macKey == null || !dupMac.Contains(macKey)) &&
+                     (ipKey == null || !dupIp.Contains(ipKey));
+
+            if (ok)
+                yield return new SpectreUi.OkRow(t.LineNo, t.Label, t.Ip?.ToString(), SpectreUi.FormatMac(t.Mac));
+        }
+    }
+
+    private static string NormalizeMac(PhysicalAddress mac) =>
+        BitConverter.ToString(mac.GetAddressBytes()).Replace("-", "").ToUpperInvariant();
+
+    private static string? NormalizeMacOrNull(PhysicalAddress? mac) =>
+        mac is null ? null : NormalizeMac(mac);
+
+    private static PreflightIssue Issue(Severity s, Target t, string msg, string? suggestion = null) =>
+        new(s, t.LineNo, t.Label, t.Ip, t.Mac, msg, suggestion);
+
+    // ----- helpers -----
+    private static bool IsUnspecified(IPAddress ip) => ip.Equals(IPAddress.Any);
+    private static bool IsLinkLocal169(IPAddress ip)
+    {
+        var b = ip.GetAddressBytes();
+        return b[0] == 169 && b[1] == 254;
+    }
+    private static bool IsMulticast(IPAddress ip)
+    {
+        var b = ip.GetAddressBytes();
+        return b[0] >= 224 && b[0] <= 239; // 224.0.0.0/4
+    }
+    private static bool IsAllZeros(PhysicalAddress mac) => mac.GetAddressBytes().All(b => b == 0x00);
+    private static bool IsAllFFs(PhysicalAddress mac) => mac.GetAddressBytes().All(b => b == 0xFF);
+    private static bool IsMulticastMac(PhysicalAddress mac)
+    {
+        var first = mac.GetAddressBytes()[0];
+        return (first & 0x01) != 0; // group/multicast bit set
+    }
+}
+
 
 /* ============================= NET HELPERS ============================= */
 
@@ -507,7 +916,7 @@ internal static class ArpHelper
         return list;
     }
 
-    private static async Task<(bool ok, string output)> Run(string fileName, string arguments)
+    internal static async Task<(bool ok, string output)> Run(string fileName, string arguments)
     {
         try
         {
@@ -532,6 +941,88 @@ internal static class ArpHelper
     }
 }
 
+/* ============================= ENV CHECKS ============================= */
+
+internal static class EnvironmentChecks
+{
+    public static async Task<IEnumerable<PreflightIssue>> RunAsync()
+    {
+        var list = new List<PreflightIssue>();
+
+        // 1) Neighbor tooling availability
+        if (OperatingSystem.IsWindows())
+        {
+            var (ok, _) = await ArpHelper.Run("arp", "-a");
+            if (!ok)
+                list.Add(new PreflightIssue(
+                    Severity.Warning, null, null, null, null,
+                    "Could not execute 'arp -a' on Windows.",
+                    "Ensure 'arp.exe' is available (PATH) to enable ARP/neighbor discovery."));
+        }
+        else if (OperatingSystem.IsLinux())
+        {
+            var (okIp, _) = await ArpHelper.Run("ip", "neigh show");
+            var (okArp, _) = await ArpHelper.Run("arp", "-an");
+            if (!okIp && !okArp)
+                list.Add(new PreflightIssue(
+                    Severity.Warning, null, null, null, null,
+                    "Neither 'ip neigh' nor 'arp -an' executed successfully.",
+                    "Install iproute2 or net-tools to enable ARP/neighbor discovery."));
+        }
+        else if (OperatingSystem.IsMacOS())
+        {
+            var (ok, _) = await ArpHelper.Run("arp", "-an");
+            if (!ok)
+                list.Add(new PreflightIssue(
+                    Severity.Warning, null, null, null, null,
+                    "Could not execute 'arp -an' on macOS.",
+                    "Ensure 'arp' is available to enable ARP/neighbor discovery."));
+        }
+
+        // 2) Active IPv4 interface check
+        var upIfaces = NetworkInterface.GetAllNetworkInterfaces()
+            .Where(nic =>
+                nic.OperationalStatus == OperationalStatus.Up &&
+                nic.NetworkInterfaceType != NetworkInterfaceType.Loopback &&
+                nic.NetworkInterfaceType != NetworkInterfaceType.Tunnel &&
+                nic.GetIPProperties().UnicastAddresses.Any(ua => ua.Address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork))
+            .ToList();
+
+        if (upIfaces.Count == 0)
+        {
+            list.Add(new PreflightIssue(
+                Severity.Error, null, null, null, null,
+                "No active IPv4 network interface found.",
+                "Bring up a wired NIC on the correct VLAN before running wake/query."));
+        }
+
+        // 3) Ping capability sanity (raw socket permissions, firewalls)
+        try
+        {
+            using var p = new Ping();
+            var reply = await p.SendPingAsync(IPAddress.Loopback, 200, Encoding.ASCII.GetBytes("WOLPING"));
+            // Even if it times out, the call path worked—no issue to report.
+        }
+        catch (PingException ex)
+        {
+            list.Add(new PreflightIssue(
+                Severity.Warning, null, null, null, null,
+                "Ping may be restricted by OS permissions (raw sockets).",
+                $"If ICMP checks fail, run with elevated privileges or use ARP/TCP probes. Detail: {ex.GetType().Name}"));
+        }
+        catch (Exception ex)
+        {
+            list.Add(new PreflightIssue(
+                Severity.Warning, null, null, null, null,
+                "Ping feature threw an unexpected error.",
+                $"ICMP probes may be unreliable. Detail: {ex.GetType().Name}"));
+        }
+
+        return list;
+    }
+}
+
+
 /* ============================= UI HELPERS ============================= */
 
 internal static class SpectreUi
@@ -544,6 +1035,9 @@ internal static class SpectreUi
         public static Row Fail(string status, Target t, long ms, string? msg = null) =>
             new(false, status, t.Label, t.Ip?.ToString(), FormatMac(t.Mac), ms, msg);
     }
+
+    // For preflight OK listing
+    public record OkRow(int LineNo, string? Label, string? Ip, string? MacFormatted);
 
     public static void PrintProblems(IEnumerable<string> problems)
     {
@@ -565,13 +1059,13 @@ internal static class SpectreUi
         var table = new Table()
             .Expand()
             .Border(TableBorder.Rounded)
-            .BorderColor(Spectre.Console.Color.Grey)
+            .BorderColor(Color.Grey)
             .AddColumn(new TableColumn("[bold]Status[/]").Centered())
             .AddColumn(new TableColumn("[bold]Label[/]"))
             .AddColumn(new TableColumn("[bold]IP[/]"))
             .AddColumn(new TableColumn("[bold]MAC[/]"))
             .AddColumn(new TableColumn("[bold]Time[/]").Centered())
-            .AddColumn(new TableColumn("[bold]Message[/]"));
+            .AddColumn(new TableColumn("[bold]Message / Detail[/]"));
 
         foreach (var r in rows)
         {
@@ -593,6 +1087,87 @@ internal static class SpectreUi
         AnsiConsole.WriteLine();
     }
 
+    public static void RenderPreflight(IEnumerable<PreflightIssue> findings, IEnumerable<OkRow> okRows, bool showOk, int totalTargets)
+    {
+        var errs = findings.Where(f => f.Severity == Severity.Error).ToList();
+        var warns = findings.Where(f => f.Severity == Severity.Warning).ToList();
+        var infos = findings.Where(f => f.Severity == Severity.Info).ToList();
+
+        var rule = new Rule(" [bold]Preflight[/] ");
+        rule.RuleStyle(Style.Parse("grey"));
+        rule.Justification = Justify.Center;
+        AnsiConsole.Write(rule);
+
+        if (findings.Any())
+        {
+            var table = new Table()
+                .Expand()
+                .Border(TableBorder.Rounded)
+                .BorderColor(Color.Grey)
+                .AddColumn(new TableColumn("[bold]Severity[/]").Centered())
+                .AddColumn(new TableColumn("[bold]Line[/]").Centered())
+                .AddColumn(new TableColumn("[bold]Label[/]"))
+                .AddColumn(new TableColumn("[bold]IP[/]"))
+                .AddColumn(new TableColumn("[bold]MAC[/]"))
+                .AddColumn(new TableColumn("[bold]Message[/]"))
+                .AddColumn(new TableColumn("[bold]Suggestion[/]"));
+
+            foreach (var f in findings.OrderByDescending(f => f.Severity).ThenBy(f => f.LineNo ?? int.MaxValue))
+            {
+                var sev = f.Severity switch
+                {
+                    Severity.Error => "[red]ERROR[/]",
+                    Severity.Warning => "[yellow]WARN[/]",
+                    _ => "[grey]INFO[/]"
+                };
+
+                table.AddRow(
+                    sev,
+                    f.LineNo?.ToString() ?? "-",
+                    Markup.Escape(f.Label ?? "-"),
+                    Markup.Escape(f.Ip?.ToString() ?? "-"),
+                    Markup.Escape(FormatMac(f.Mac)),
+                    Markup.Escape(f.Message),
+                    Markup.Escape(f.Suggestion ?? "-")
+                );
+            }
+
+            AnsiConsole.Write(table);
+        }
+        else
+        {
+            AnsiConsole.MarkupLine("[green]No issues found in configuration.[/]");
+        }
+
+        if (showOk && okRows.Any())
+        {
+            var okTable = new Table()
+                .Expand()
+                .Border(TableBorder.Ascii)
+                .BorderColor(Color.Grey)
+                .AddColumn(new TableColumn("[bold]OK Line[/]").Centered())
+                .AddColumn(new TableColumn("[bold]Label[/]"))
+                .AddColumn(new TableColumn("[bold]IP[/]"))
+                .AddColumn(new TableColumn("[bold]MAC[/]"));
+
+            foreach (var r in okRows.OrderBy(r => r.LineNo))
+            {
+                okTable.AddRow(r.LineNo.ToString(), Markup.Escape(r.Label ?? "-"),
+                               Markup.Escape(r.Ip ?? "-"),
+                               Markup.Escape(r.MacFormatted ?? "-"));
+            }
+
+            AnsiConsole.Write(new Rule(" Clean Entries ").RuleStyle(Style.Parse("grey")));
+            AnsiConsole.Write(okTable);
+        }
+
+        var summary = $"Targets parsed: [bold]{totalTargets}[/]  |  " +
+                      $"Errors: [red]{errs.Count}[/]  |  Warnings: [yellow]{warns.Count}[/]  |  Info: [grey]{infos.Count}[/]";
+        AnsiConsole.Write(new Rule().RuleStyle(Style.Parse("grey")));
+        AnsiConsole.MarkupLine(summary);
+        AnsiConsole.WriteLine();
+    }
+
     public static bool PhysicalAddressEquals(PhysicalAddress a, PhysicalAddress b)
         => a.GetAddressBytes().AsSpan().SequenceEqual(b.GetAddressBytes());
 
@@ -604,3 +1179,4 @@ internal static class SpectreUi
         return string.Join(":", Enumerable.Range(0, 6).Select(i => s.Substring(i * 2, 2)));
     }
 }
+
