@@ -98,11 +98,18 @@ public sealed class WakeSettings : CommonSettings
     [Description("Source/local IPv4 address to bind when sending broadcast (useful on multi-homed hosts).")]
     public string? InterfaceIp { get; set; }
 
+    [CommandOption("--backoff-mult <X>")]
+    [Description("Backoff multiplier for gaps between WOL packets (e.g., 1.0=no backoff, 1.5=exponential). Default: 1.0")]
+    public double BackoffMult { get; set; } = 1.0;
+
+    [CommandOption("--jitter-pct <0-1>")]
+    [Description("Jitter percentage applied to each inter-packet delay (0..1). Default: 0")]
+    public double JitterPct { get; set; } = 0.0;
+
     public override ValidationResult Validate()
     {
         var vr = base.Validate();
-        if (!vr.Successful)
-            return vr;
+        if (!vr.Successful) return vr;
 
         if (!IPAddress.TryParse(Broadcast, out _))
             return ValidationResult.Error("Invalid --broadcast IP address.");
@@ -119,6 +126,8 @@ public sealed class WakeSettings : CommonSettings
                 return ValidationResult.Error("--interface must be a non-loopback, bound local IPv4.");
         }
 
+        if (BackoffMult < 1.0) return ValidationResult.Error("--backoff-mult must be >= 1.0");
+        if (JitterPct is < 0.0 or > 1.0) return ValidationResult.Error("--jitter-pct must be between 0 and 1");
         return ValidationResult.Success();
     }
 }
@@ -141,15 +150,29 @@ public sealed class QuerySettings : CommonSettings
     [Description("If only MAC is present, try to discover IP from ARP/neighbors first. Default: true")]
     public bool TryArp { get; set; } = true;
 
+    [CommandOption("-d|--delay-ms <MS>")]
+    [Description("Base delay between ping attempts. Default: 100")]
+    public int DelayMs { get; set; } = 100;
+
+    [CommandOption("--backoff-mult <X>")]
+    [Description("Backoff multiplier for gaps between ping attempts (e.g., 1.0=no backoff, 1.5=exponential). Default: 1.5")]
+    public double BackoffMult { get; set; } = 1.5;
+
+    [CommandOption("--jitter-pct <0-1>")]
+    [Description("Jitter percentage applied to inter-attempt delays (0..1). Default: 0.2")]
+    public double JitterPct { get; set; } = 0.2;
+
     public override ValidationResult Validate()
     {
         var vr = base.Validate();
-        if (!vr.Successful)
-            return vr;
+        if (!vr.Successful) return vr;
 
         if (TimeoutMs < 1) return ValidationResult.Error("--timeout-ms must be >= 1.");
         if (Count < 1) return ValidationResult.Error("--count must be >= 1.");
         if (Parallelism < 1) return ValidationResult.Error("--parallelism must be >= 1.");
+        if (DelayMs < 0) return ValidationResult.Error("--delay-ms must be >= 0.");
+        if (BackoffMult < 1.0) return ValidationResult.Error("--backoff-mult must be >= 1.0");
+        if (JitterPct is < 0.0 or > 1.0) return ValidationResult.Error("--jitter-pct must be between 0 and 1");
         return ValidationResult.Success();
     }
 }
@@ -245,7 +268,7 @@ public sealed class WakeCommand : AsyncCommand<WakeSettings>
 
             try
             {
-                await WolSender.SendAsync(t.Mac, broadcast, settings.Port, settings.Repeat, settings.IntervalMs, sourceIp);
+                await WolSender.SendAsync(t.Mac, broadcast, settings.Port, settings.Repeat, settings.IntervalMs, sourceIp, settings.BackoffMult, settings.JitterPct);
                 results.Add(SpectreUi.Row.Ok("Sent", t, sw.ElapsedMilliseconds));
                 Interlocked.Increment(ref ok);
             }
@@ -307,7 +330,7 @@ public sealed class QueryCommand : AsyncCommand<QuerySettings>
 
             try
             {
-                var isUp = await Pinger.PingAsync(t.Ip, settings.TimeoutMs, settings.Count);
+                var isUp = await Pinger.PingAsync(t.Ip, settings.TimeoutMs, settings.Count, settings.DelayMs, settings.BackoffMult, settings.JitterPct);
                 if (isUp)
                 {
                     results.Add(SpectreUi.Row.Ok("Online", t, sw.ElapsedMilliseconds));
@@ -788,12 +811,14 @@ internal static class ConfigValidator
 internal static class WolSender
 {
     public static Task SendAsync(PhysicalAddress mac, IPAddress broadcast, int port, int repeat, int intervalMs)
-        => SendAsync(mac, broadcast, port, repeat, intervalMs, sourceIp: null);
+        => SendAsync(mac, broadcast, port, repeat, intervalMs, sourceIp: null, backoffMult: 1.0, jitterPct: 0.0);
 
-    public static async Task SendAsync(PhysicalAddress mac, IPAddress broadcast, int port, int repeat, int intervalMs, IPAddress? sourceIp)
+    public static Task SendAsync(PhysicalAddress mac, IPAddress broadcast, int port, int repeat, int intervalMs, IPAddress? sourceIp)
+        => SendAsync(mac, broadcast, port, repeat, intervalMs, sourceIp, backoffMult: 1.0, jitterPct: 0.0);
+
+    public static async Task SendAsync(PhysicalAddress mac, IPAddress broadcast, int port, int repeat, int intervalMs, IPAddress? sourceIp, double backoffMult, double jitterPct)
     {
         var packet = BuildMagicPacket(mac);
-
         UdpClient udp = sourceIp is null
             ? new UdpClient() { EnableBroadcast = true }
             : new UdpClient(new IPEndPoint(sourceIp, 0)) { EnableBroadcast = true };
@@ -804,8 +829,12 @@ internal static class WolSender
             for (int i = 0; i < repeat; i++)
             {
                 await udp.SendAsync(packet, packet.Length, endpoint);
+
                 if (i + 1 < repeat && intervalMs > 0)
-                    await Task.Delay(intervalMs);
+                {
+                    var delay = Backoff.NextDelayMs(i, intervalMs, backoffMult, jitterPct);
+                    if (delay > 0) await Task.Delay(delay);
+                }
             }
         }
     }
@@ -824,14 +853,24 @@ internal static class WolSender
 
 internal static class Pinger
 {
-    public static async Task<bool> PingAsync(IPAddress ip, int timeoutMs, int count)
+    public static Task<bool> PingAsync(IPAddress ip, int timeoutMs, int count)
+        => PingAsync(ip, timeoutMs, count, delayMs: 0, backoffMult: 1.0, jitterPct: 0.0);
+
+    public static async Task<bool> PingAsync(IPAddress ip, int timeoutMs, int count, int delayMs, double backoffMult, double jitterPct)
     {
         using var p = new Ping();
         byte[] buffer = Encoding.ASCII.GetBytes("WOLPING");
+
         for (int i = 0; i < count; i++)
         {
             var reply = await p.SendPingAsync(ip, timeoutMs, buffer);
             if (reply.Status == IPStatus.Success) return true;
+
+            if (i + 1 < count && delayMs > 0)
+            {
+                var pause = Backoff.NextDelayMs(i, delayMs, backoffMult, jitterPct);
+                if (pause > 0) await Task.Delay(pause);
+            }
         }
         return false;
     }
@@ -1047,6 +1086,34 @@ internal static class EnvironmentChecks
         return list;
     }
 }
+
+internal static class Backoff
+{
+    private static readonly ThreadLocal<Random> Rng =
+        new(() => new Random(unchecked(Environment.TickCount * 31 + Environment.CurrentManagedThreadId)));
+
+    public static int NextDelayMs(int attemptIndex, int baseDelayMs, double mult, double jitterPct)
+    {
+        if (attemptIndex < 0) attemptIndex = 0;
+        if (baseDelayMs < 0) baseDelayMs = 0;
+        if (mult < 1.0) mult = 1.0;
+        if (jitterPct < 0) jitterPct = 0;
+        if (jitterPct > 1) jitterPct = 1;
+
+        double ideal = baseDelayMs * Math.Pow(mult, attemptIndex);
+        if (ideal <= 0) return 0;
+
+        if (jitterPct == 0) return (int)Math.Round(Math.Min(ideal, int.MaxValue));
+
+        // jitter in range [-jitterPct, +jitterPct]
+        double delta = (Rng.Value!.NextDouble() * 2 - 1) * jitterPct;
+        double jittered = ideal * (1.0 + delta);
+        if (jittered < 0) jittered = 0;
+        if (jittered > int.MaxValue) jittered = int.MaxValue;
+        return (int)Math.Round(jittered);
+    }
+}
+
 
 
 /* ============================= UI HELPERS ============================= */
