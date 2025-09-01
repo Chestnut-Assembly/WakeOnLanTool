@@ -220,6 +220,28 @@ public sealed class PreflightSettings : CommonSettings
     }
 }
 
+internal static class CtrlC
+{
+    private static int _printed;
+
+    public static CancellationToken Setup(out CancellationTokenSource cts)
+    {
+        var tokenSource = cts = new CancellationTokenSource();
+        Console.CancelKeyPress += (s, e) =>
+        {
+            if (!tokenSource.IsCancellationRequested)
+            {
+                e.Cancel = true; // prevent hard kill; we’ll exit gracefully
+                tokenSource.Cancel();
+                if (Interlocked.Exchange(ref _printed, 1) == 0)
+                    AnsiConsole.MarkupLine("[yellow]Cancellation requested. Finishing in-flight work…[/]");
+            }
+        };
+        return tokenSource.Token;
+    }
+}
+
+
 
 /* ============================= COMMANDS ============================= */
 
@@ -227,6 +249,9 @@ public sealed class WakeCommand : AsyncCommand<WakeSettings>
 {
     public override async Task<int> ExecuteAsync(CommandContext context, WakeSettings settings)
     {
+        using var _ = new System.Reactive.Disposables.CompositeDisposable(); // harmless; allows future disposables if needed
+        var token = CtrlC.Setup(out var cts);
+
         var broadcast = IPAddress.Parse(settings.Broadcast);
         var configFile = new FileInfo(settings.ConfigPath);
         IPAddress? sourceIp = null;
@@ -237,16 +262,16 @@ public sealed class WakeCommand : AsyncCommand<WakeSettings>
         var (targets, problems) = ConfigLoader.Load(configFile);
         SpectreUi.PrintProblems(problems.Select(p => p.ToString()));
 
-        if (settings.TryArp)
+        if (settings.TryArp && !token.IsCancellationRequested)
         {
             var needMac = targets.Where(t => t.Mac is null && t.Ip is not null).ToList();
             if (needMac.Count > 0)
             {
                 await AnsiConsole.Status()
                     .Spinner(Spinner.Known.Dots)
-                    .StartAsync($"Attempting ARP resolution for {needMac.Count} target(s)...", async _ =>
+                    .StartAsync($"Attempting ARP resolution for {needMac.Count} target(s)… (Ctrl+C to cancel)", async _ =>
                     {
-                        await ArpHelper.TryPopulateMacsFromArpAsync(needMac);
+                        await ArpHelper.TryPopulateMacsFromArpAsync(needMac, token);
                     });
             }
         }
@@ -255,38 +280,53 @@ public sealed class WakeCommand : AsyncCommand<WakeSettings>
         int ok = 0, fail = 0, skip = 0;
         var swTotal = Stopwatch.StartNew();
 
-        await Parallel.ForEachAsync(targets, new ParallelOptions { MaxDegreeOfParallelism = settings.Parallelism }, async (t, _) =>
+        try
         {
-            var sw = Stopwatch.StartNew();
+            await Parallel.ForEachAsync(
+                targets,
+                new ParallelOptions { MaxDegreeOfParallelism = settings.Parallelism, CancellationToken = token },
+                async (t, ct) =>
+                {
+                    var sw = Stopwatch.StartNew();
 
-            if (t.Mac is null)
-            {
-                results.Add(SpectreUi.Row.Fail("SKIP (no MAC)", t, sw.ElapsedMilliseconds));
-                Interlocked.Increment(ref skip);
-                return;
-            }
+                    if (t.Mac is null)
+                    {
+                        results.Add(SpectreUi.Row.Fail("SKIP (no MAC)", t, sw.ElapsedMilliseconds));
+                        Interlocked.Increment(ref skip);
+                        return;
+                    }
 
-            try
-            {
-                await WolSender.SendAsync(t.Mac, broadcast, settings.Port, settings.Repeat, settings.IntervalMs, sourceIp, settings.BackoffMult, settings.JitterPct);
-                results.Add(SpectreUi.Row.Ok("Sent", t, sw.ElapsedMilliseconds));
-                Interlocked.Increment(ref ok);
-            }
-            catch (Exception ex)
-            {
-                results.Add(SpectreUi.Row.Fail(ex.GetType().Name, t, sw.ElapsedMilliseconds, ex.Message));
-                Interlocked.Increment(ref fail);
-            }
-        });
+                    try
+                    {
+                        await WolSender.SendAsync(t.Mac, broadcast, settings.Port, settings.Repeat, settings.IntervalMs, sourceIp, settings.BackoffMult, settings.JitterPct, ct);
+                        results.Add(SpectreUi.Row.Ok("Sent", t, sw.ElapsedMilliseconds));
+                        Interlocked.Increment(ref ok);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        results.Add(SpectreUi.Row.Fail("Canceled", t, sw.ElapsedMilliseconds, "User requested cancel."));
+                        throw;
+                    }
+                    catch (Exception ex)
+                    {
+                        results.Add(SpectreUi.Row.Fail(ex.GetType().Name, t, sw.ElapsedMilliseconds, ex.Message));
+                        Interlocked.Increment(ref fail);
+                    }
+                });
+        }
+        catch (OperationCanceledException)
+        {
+            // graceful summary below
+        }
 
         swTotal.Stop();
 
         SpectreUi.RenderResults(
             "Wake Results",
             results.OrderBy(r => r.Label ?? "~").ThenBy(r => r.Ip ?? string.Empty),
-            $"OK={ok}, Failed={fail}, Skipped={skip}. Total [bold]{swTotal.Elapsed.TotalMilliseconds:F0} ms[/].");
+            $"{(token.IsCancellationRequested ? "[yellow]Canceled by user.[/] " : "")}OK={ok}, Failed={fail}, Skipped={skip}. Total [bold]{swTotal.Elapsed.TotalMilliseconds:F0} ms[/].");
 
-        return fail == 0 ? 0 : 1;
+        return token.IsCancellationRequested ? 130 : (fail == 0 ? 0 : 1);
     }
 }
 
@@ -294,21 +334,22 @@ public sealed class QueryCommand : AsyncCommand<QuerySettings>
 {
     public override async Task<int> ExecuteAsync(CommandContext context, QuerySettings settings)
     {
+        var token = CtrlC.Setup(out var cts);
         var configFile = new FileInfo(settings.ConfigPath);
 
         var (targets, problems) = ConfigLoader.Load(configFile);
         SpectreUi.PrintProblems(problems.Select(p => p.ToString()));
 
-        if (settings.TryArp)
+        if (settings.TryArp && !token.IsCancellationRequested)
         {
             var needIp = targets.Where(t => t.Ip is null && t.Mac is not null).ToList();
             if (needIp.Count > 0)
             {
                 await AnsiConsole.Status()
                     .Spinner(Spinner.Known.Dots)
-                    .StartAsync($"Attempting ARP/neighbor discovery for {needIp.Count} target(s)...", async _ =>
+                    .StartAsync($"Attempting ARP/neighbor discovery for {needIp.Count} target(s)… (Ctrl+C to cancel)", async _ =>
                     {
-                        await ArpHelper.TryPopulateIpsFromArpAsync(needIp);
+                        await ArpHelper.TryPopulateIpsFromArpAsync(needIp, token);
                     });
             }
         }
@@ -317,46 +358,61 @@ public sealed class QueryCommand : AsyncCommand<QuerySettings>
         int up = 0, down = 0, unknown = 0;
         var swTotal = Stopwatch.StartNew();
 
-        await Parallel.ForEachAsync(targets, new ParallelOptions { MaxDegreeOfParallelism = settings.Parallelism }, async (t, _) =>
+        try
         {
-            var sw = Stopwatch.StartNew();
-
-            if (t.Ip is null)
-            {
-                results.Add(SpectreUi.Row.Fail("Unknown (no IP)", t, sw.ElapsedMilliseconds));
-                Interlocked.Increment(ref unknown);
-                return;
-            }
-
-            try
-            {
-                var isUp = await Pinger.PingAsync(t.Ip, settings.TimeoutMs, settings.Count, settings.DelayMs, settings.BackoffMult, settings.JitterPct);
-                if (isUp)
+            await Parallel.ForEachAsync(
+                targets,
+                new ParallelOptions { MaxDegreeOfParallelism = settings.Parallelism, CancellationToken = token },
+                async (t, ct) =>
                 {
-                    results.Add(SpectreUi.Row.Ok("Online", t, sw.ElapsedMilliseconds));
-                    Interlocked.Increment(ref up);
-                }
-                else
-                {
-                    results.Add(SpectreUi.Row.Fail("No reply", t, sw.ElapsedMilliseconds));
-                    Interlocked.Increment(ref down);
-                }
-            }
-            catch (Exception ex)
-            {
-                results.Add(SpectreUi.Row.Fail(ex.GetType().Name, t, sw.ElapsedMilliseconds, ex.Message));
-                Interlocked.Increment(ref down);
-            }
-        });
+                    var sw = Stopwatch.StartNew();
+
+                    if (t.Ip is null)
+                    {
+                        results.Add(SpectreUi.Row.Fail("Unknown (no IP)", t, sw.ElapsedMilliseconds));
+                        Interlocked.Increment(ref unknown);
+                        return;
+                    }
+
+                    try
+                    {
+                        var isUp = await Pinger.PingAsync(t.Ip, settings.TimeoutMs, settings.Count, settings.DelayMs, settings.BackoffMult, settings.JitterPct, ct);
+                        if (isUp)
+                        {
+                            results.Add(SpectreUi.Row.Ok("Online", t, sw.ElapsedMilliseconds));
+                            Interlocked.Increment(ref up);
+                        }
+                        else
+                        {
+                            results.Add(SpectreUi.Row.Fail("No reply", t, sw.ElapsedMilliseconds));
+                            Interlocked.Increment(ref down);
+                        }
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        results.Add(SpectreUi.Row.Fail("Canceled", t, sw.ElapsedMilliseconds, "User requested cancel."));
+                        throw;
+                    }
+                    catch (Exception ex)
+                    {
+                        results.Add(SpectreUi.Row.Fail(ex.GetType().Name, t, sw.ElapsedMilliseconds, ex.Message));
+                        Interlocked.Increment(ref down);
+                    }
+                });
+        }
+        catch (OperationCanceledException)
+        {
+            // graceful summary below
+        }
 
         swTotal.Stop();
 
         SpectreUi.RenderResults(
             "Query Results",
             results.OrderBy(r => r.Label ?? "~").ThenBy(r => r.Ip ?? string.Empty),
-            $"Online={up}, Offline={down}, Unknown={unknown}. Total [bold]{swTotal.Elapsed.TotalMilliseconds:F0} ms[/].");
+            $"{(token.IsCancellationRequested ? "[yellow]Canceled by user.[/] " : "")}Online={up}, Offline={down}, Unknown={unknown}. Total [bold]{swTotal.Elapsed.TotalMilliseconds:F0} ms[/].");
 
-        return down == 0 ? 0 : 1;
+        return token.IsCancellationRequested ? 130 : (down == 0 ? 0 : 1);
     }
 }
 
@@ -365,9 +421,12 @@ public sealed class PreflightCommand : AsyncCommand<PreflightSettings>
 {
     public override async Task<int> ExecuteAsync(CommandContext context, PreflightSettings settings)
     {
+        var token = CtrlC.Setup(out var cts);
         var configFile = new FileInfo(settings.ConfigPath);
 
         var (targets, parseProblems) = ConfigLoader.Load(configFile);
+
+        token.ThrowIfCancellationRequested();
 
         var findings = new List<PreflightIssue>();
 
@@ -399,6 +458,8 @@ public sealed class PreflightCommand : AsyncCommand<PreflightSettings>
         var errorCount = findings.Count(f => f.Severity == Severity.Error);
         var warnCount = findings.Count(f => f.Severity == Severity.Warning);
         var okRows = ConfigValidator.IdentifyOkRows(targets).ToList();
+
+        token.ThrowIfCancellationRequested();
 
         SpectreUi.RenderPreflight(findings, okRows, settings.ShowOk, targets.Count);
 
@@ -811,13 +872,27 @@ internal static class ConfigValidator
 internal static class WolSender
 {
     public static Task SendAsync(PhysicalAddress mac, IPAddress broadcast, int port, int repeat, int intervalMs)
-        => SendAsync(mac, broadcast, port, repeat, intervalMs, sourceIp: null, backoffMult: 1.0, jitterPct: 0.0);
+        => SendAsync(mac, broadcast, port, repeat, intervalMs, sourceIp: null, backoffMult: 1.0, jitterPct: 0.0, CancellationToken.None);
 
     public static Task SendAsync(PhysicalAddress mac, IPAddress broadcast, int port, int repeat, int intervalMs, IPAddress? sourceIp)
-        => SendAsync(mac, broadcast, port, repeat, intervalMs, sourceIp, backoffMult: 1.0, jitterPct: 0.0);
+        => SendAsync(mac, broadcast, port, repeat, intervalMs, sourceIp, backoffMult: 1.0, jitterPct: 0.0, CancellationToken.None);
 
-    public static async Task SendAsync(PhysicalAddress mac, IPAddress broadcast, int port, int repeat, int intervalMs, IPAddress? sourceIp, double backoffMult, double jitterPct)
+    public static Task SendAsync(PhysicalAddress mac, IPAddress broadcast, int port, int repeat, int intervalMs, IPAddress? sourceIp, double backoffMult, double jitterPct)
+        => SendAsync(mac, broadcast, port, repeat, intervalMs, sourceIp, backoffMult, jitterPct, CancellationToken.None);
+
+    public static async Task SendAsync(
+        PhysicalAddress mac,
+        IPAddress broadcast,
+        int port,
+        int repeat,
+        int intervalMs,
+        IPAddress? sourceIp,
+        double backoffMult,
+        double jitterPct,
+        CancellationToken ct)
     {
+        ct.ThrowIfCancellationRequested();
+
         var packet = BuildMagicPacket(mac);
         UdpClient udp = sourceIp is null
             ? new UdpClient() { EnableBroadcast = true }
@@ -828,12 +903,13 @@ internal static class WolSender
             var endpoint = new IPEndPoint(broadcast, port);
             for (int i = 0; i < repeat; i++)
             {
+                ct.ThrowIfCancellationRequested();
                 await udp.SendAsync(packet, packet.Length, endpoint);
 
                 if (i + 1 < repeat && intervalMs > 0)
                 {
                     var delay = Backoff.NextDelayMs(i, intervalMs, backoffMult, jitterPct);
-                    if (delay > 0) await Task.Delay(delay);
+                    if (delay > 0) await Task.Delay(delay, ct);
                 }
             }
         }
@@ -854,23 +930,31 @@ internal static class WolSender
 internal static class Pinger
 {
     public static Task<bool> PingAsync(IPAddress ip, int timeoutMs, int count)
-        => PingAsync(ip, timeoutMs, count, delayMs: 0, backoffMult: 1.0, jitterPct: 0.0);
+        => PingAsync(ip, timeoutMs, count, delayMs: 0, backoffMult: 1.0, jitterPct: 0.0, CancellationToken.None);
 
-    public static async Task<bool> PingAsync(IPAddress ip, int timeoutMs, int count, int delayMs, double backoffMult, double jitterPct)
+    public static Task<bool> PingAsync(IPAddress ip, int timeoutMs, int count, int delayMs, double backoffMult, double jitterPct)
+        => PingAsync(ip, timeoutMs, count, delayMs, backoffMult, jitterPct, CancellationToken.None);
+
+    public static async Task<bool> PingAsync(IPAddress ip, int timeoutMs, int count, int delayMs, double backoffMult, double jitterPct, CancellationToken ct)
     {
+        ct.ThrowIfCancellationRequested();
+
         using var p = new Ping();
         byte[] buffer = Encoding.ASCII.GetBytes("WOLPING");
 
         for (int i = 0; i < count; i++)
         {
+            // Note: SendPingAsync does not support a CancellationToken; we cancel between attempts.
             var reply = await p.SendPingAsync(ip, timeoutMs, buffer);
             if (reply.Status == IPStatus.Success) return true;
 
             if (i + 1 < count && delayMs > 0)
             {
                 var pause = Backoff.NextDelayMs(i, delayMs, backoffMult, jitterPct);
-                if (pause > 0) await Task.Delay(pause);
+                if (pause > 0) await Task.Delay(pause, ct);
             }
+
+            ct.ThrowIfCancellationRequested();
         }
         return false;
     }
@@ -878,31 +962,37 @@ internal static class Pinger
 
 internal static class ArpHelper
 {
-    public static async Task TryPopulateMacsFromArpAsync(List<Target> targets)
+    public static async Task TryPopulateMacsFromArpAsync(List<Target> targets, CancellationToken ct = default)
     {
-        // Nudge ARP cache by pinging known IPs
-        await Parallel.ForEachAsync(targets, new ParallelOptions { MaxDegreeOfParallelism = Math.Min(16, Environment.ProcessorCount) }, async (t, _) =>
-        {
-            if (t.Ip is null) return;
-            try { await Pinger.PingAsync(t.Ip, 200, 1); } catch { /* ignore */ }
-        });
+        await Parallel.ForEachAsync(
+            targets,
+            new ParallelOptions { MaxDegreeOfParallelism = Math.Min(16, Environment.ProcessorCount), CancellationToken = ct },
+            async (t, token) =>
+            {
+                if (t.Ip is null) return;
+                try { await Pinger.PingAsync(t.Ip, 200, 1, 0, 1.0, 0.0, token); } catch { /* ignore */ }
+            });
 
-        var table = await ReadNeighborsAsync();
+        ct.ThrowIfCancellationRequested();
+        var table = await ReadNeighborsAsync(); // best-effort; underlying proc has no ct
 
         foreach (var t in targets)
         {
+            ct.ThrowIfCancellationRequested();
             if (t.Ip is null) continue;
             var found = table.FirstOrDefault(n => n.ip.Equals(t.Ip));
             if (found.mac is not null) t.Mac = found.mac;
         }
     }
 
-    public static async Task TryPopulateIpsFromArpAsync(List<Target> targets)
+    public static async Task TryPopulateIpsFromArpAsync(List<Target> targets, CancellationToken ct = default)
     {
+        ct.ThrowIfCancellationRequested();
         var table = await ReadNeighborsAsync();
 
         foreach (var t in targets)
         {
+            ct.ThrowIfCancellationRequested();
             if (t.Mac is null) continue;
             var found = table.FirstOrDefault(n => SpectreUi.PhysicalAddressEquals(n.mac, t.Mac));
             if (found.ip is not null) t.Ip = found.ip;
